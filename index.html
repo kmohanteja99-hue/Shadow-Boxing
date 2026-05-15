@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KINESIS AI SHADOW BOXING</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+        canvas { position: absolute; transform: scaleX(-1); } /* Mirror the view */
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            color: white;
+            z-index: 10;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.5);
+        }
+        .impact { color: #ff0000; font-size: 2.5rem; font-weight: bold; }
+        .velocity { color: #ffff00; font-size: 1.5rem; }
+        #instruction {
+            position: absolute;
+            bottom: 20px;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 1rem;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="container">
+        <video id="input_video" style="display:none;"></video>
+        <canvas id="output_canvas"></canvas>
+        <div id="hud">
+            <div id="score" class="impact">IMPACT: 0</div>
+            <div id="speed" class="velocity">VELOCITY: 0 MPH</div>
+        </div>
+        <div id="instruction">CLICK SCREEN TO ENABLE SOUND</div>
+    </div>
+
+<script>
+const videoElement = document.getElementById('input_video');
+const canvasElement = document.getElementById('output_canvas');
+const canvasCtx = canvasElement.getContext('2d');
+const scoreEl = document.getElementById('score');
+const speedEl = document.getElementById('speed');
+
+let score = 0;
+let lastSpeed = 0;
+let targets = [];
+let particles = [];
+let trailHistory = { 'L': [], 'R': [] };
+let velocityHistory = { 'L': [], 'R': [] };
+
+// --- AUDIO ENGINE ---
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playHitSound() {
+    if (audioCtx.state === 'suspended') return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(110, audioCtx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.1);
+}
+
+// --- GAME LOGIC ---
+function spawnTarget() {
+    if (targets.length < 1) {
+        targets.push({
+            x: Math.random() * (canvasElement.width - 200) + 100,
+            y: Math.random() * (canvasElement.height - 200) + 100,
+            r: 45
+        });
+    }
+}
+
+function onResults(results) {
+    // Resize canvas to window
+    canvasElement.width = window.innerWidth;
+    canvasElement.height = window.innerHeight;
+    const w = canvasElement.width;
+    const h = canvasElement.height;
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, w, h);
+    
+    // Draw Video Frame
+    canvasCtx.drawImage(results.image, 0, 0, w, h);
+
+    spawnTarget();
+
+    // 1. Process Particles (Explosions)
+    particles.forEach((p, i) => {
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= 10;
+        if (p.life <= 0) particles.splice(i, 1);
+        else {
+            canvasCtx.beginPath();
+            canvasCtx.arc(p.x, p.y, 3, 0, 2 * Math.PI);
+            canvasCtx.fillStyle = `rgba(100, 255, 255, ${p.life/255})`;
+            canvasCtx.fill();
+        }
+    });
+
+    if (results.poseLandmarks) {
+        const lm = results.poseLandmarks;
+        const hands = [{idx: 15, side: 'L'}, {idx: 16, side: 'R'}];
+
+        hands.forEach(hand => {
+            const cx = lm[hand.idx].x * w;
+            const cy = lm[hand.idx].y * h;
+
+            // Trail Logic (Blue motion trails)
+            trailHistory[hand.side].push({x: cx, y: cy});
+            if (trailHistory[hand.side].length > 10) trailHistory[hand.side].shift();
+
+            // Draw Trail
+            for (let i = 1; i < trailHistory[hand.side].length; i++) {
+                canvasCtx.beginPath();
+                canvasCtx.moveTo(trailHistory[hand.side][i-1].x, trailHistory[hand.side][i-1].y);
+                canvasCtx.lineTo(trailHistory[hand.side][i].x, trailHistory[hand.side][i].y);
+                canvasCtx.strokeStyle = '#00C8FF';
+                canvasCtx.lineWidth = i * 2;
+                canvasCtx.lineCap = 'round';
+                canvasCtx.stroke();
+            }
+
+            // Velocity & Collision
+            const now = Date.now();
+            velocityHistory[hand.side].push({x: cx, y: cy, t: now});
+            if (velocityHistory[hand.side].length > 5) velocityHistory[hand.side].shift();
+
+            if (velocityHistory[hand.side].length >= 2) {
+                const p1 = velocityHistory[hand.side][0];
+                const p2 = velocityHistory[hand.side][velocityHistory[hand.side].length-1];
+                const dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
+                const dt = (p2.t - p1.t) / 1000;
+                const speed = (dist / dt) * 0.005;
+
+                targets.forEach((t, i) => {
+                    const distToTarget = Math.sqrt(Math.pow(cx - t.x, 2) + Math.pow(cy - t.y, 2));
+                    // Check if hand hits target with enough speed
+                    if (distToTarget < t.r + 30 && speed > 5) {
+                        score += Math.floor(speed * 10);
+                        lastSpeed = Math.floor(speed);
+                        scoreEl.innerText = `IMPACT: ${score}`;
+                        speedEl.innerText = `VELOCITY: ${lastSpeed} MPH`;
+                        playHitSound();
+
+                        // Create Explosion particles
+                        for(let j=0; j<15; j++) {
+                            particles.push({
+                                x: t.x, y: t.y, 
+                                vx: (Math.random()-0.5)*20, 
+                                vy: (Math.random()-0.5)*20, 
+                                life: 255
+                            });
+                        }
+                        targets.splice(i, 1);
+                    }
+                });
+            }
+        });
+    }
+
+    // Draw Target Orbs
+    targets.forEach(t => {
+        // Outer ring
+        canvasCtx.beginPath();
+        canvasCtx.arc(t.x, t.y, t.r, 0, 2 * Math.PI);
+        canvasCtx.strokeStyle = 'white';
+        canvasCtx.lineWidth = 3;
+        canvasCtx.stroke();
+        
+        // Inner core
+        canvasCtx.beginPath();
+        canvasCtx.arc(t.x, t.y, 12, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = '#FFA500';
+        canvasCtx.fill();
+    });
+
+    canvasCtx.restore();
+}
+
+// --- INITIALIZATION ---
+const pose = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+});
+
+pose.setOptions({
+    modelComplexity: 0,
+    smoothLandmarks: true,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.5
+});
+
+pose.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => {
+        await pose.send({image: videoElement});
+    },
+    width: 1280,
+    height: 720
+});
+
+// Browser requirement: Start audio on user interaction
+window.addEventListener('click', () => {
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+        document.getElementById('instruction').style.display = 'none';
+    }
+});
+
+camera.start();
+</script>
+</body>
+</html>
